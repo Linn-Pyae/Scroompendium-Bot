@@ -2,6 +2,7 @@ import os
 import re
 from urllib.parse import quote
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -10,6 +11,7 @@ if not token:
     raise RuntimeError("DISCORD_TOKEN is required")
 
 WIKI = "https://scrooms.miraheze.org/wiki/"
+API = "https://scrooms.miraheze.org/w/api.php"
 WIKILINK = re.compile(r"\[\[([^\[\]\n]+?)\]\]")
 ALLOWED_ROLES = {"Helper"}
 OPEN_CHANNELS = {"bot-commands", "questions", "trash-can"}
@@ -20,11 +22,48 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def wiki_url(title):
+def page_name(title):
     page = title.split("|", 1)[0].strip().replace(" ", "_")
-    if not page:
-        return None
+    return page or None
+
+
+def wiki_url(page):
     return WIKI + quote(page, safe="/:_-'()")
+
+
+async def existing_urls(pages):
+    if not pages:
+        return []
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "titles": "|".join(page.replace("_", " ") for page in pages),
+    }
+    try:
+        async with bot.wiki_session.get(API, params=params) as response:
+            data = await response.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError) as error:
+        print(f"Wiki check failed: {error}")
+        return [wiki_url(page) for page in pages]
+
+    if "query" not in data:
+        print(f"Wiki check failed: {data.get('error', data)}")
+        return [wiki_url(page) for page in pages]
+
+    found = set()
+    for info in data["query"].get("pages", {}).values():
+        if "missing" in info or "invalid" in info:
+            continue
+        title = info.get("title")
+        if title:
+            found.add(title.replace("_", " ").casefold())
+
+    return [
+        wiki_url(page)
+        for page in pages
+        if page.replace("_", " ").casefold() in found
+    ]
 
 
 def is_allowed(message):
@@ -45,6 +84,12 @@ def is_allowed(message):
 
 @bot.event
 async def on_ready():
+    session = getattr(bot, "wiki_session", None)
+    if session is None or session.closed:
+        bot.wiki_session = aiohttp.ClientSession(
+            headers={"User-Agent": "ScroompendiumBot/1.0"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
     print(f"Connected as {bot.user}")
 
 
@@ -53,14 +98,15 @@ async def on_message(message):
     if message.author.bot or not is_allowed(message):
         return
 
-    urls = []
+    pages = []
     for title in WIKILINK.findall(message.content):
-        url = wiki_url(title)
-        if url and url not in urls:
-            urls.append(url)
-        if len(urls) == 3:
+        page = page_name(title)
+        if page and page not in pages:
+            pages.append(page)
+        if len(pages) == 3:
             break
 
+    urls = await existing_urls(pages)
     if urls:
         await message.channel.send("\n".join(urls))
 
